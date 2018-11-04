@@ -1,0 +1,465 @@
+---
+title: "Intoduction to scRNAseq - workshop"
+author: "Yasin Kaymaz"
+date: "8/9/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Matrix)
+library(Seurat)
+library(dplyr)
+```
+
+## Part 1
+
+##### Datasets and pre-processing steps
+
+In this tutorial, we are going to mainly use Seurat package with publicly available datasets. Extensive tutorials with various contexts can be found in https://satijalab.org/seurat/.
+
+Here, in the first part, we are going to analyze a single cell RNAseq dataset product by 10X Genomics and processed through Cell Ranger(TM) pipeline to generate barcode count matrices.
+
+
+Please, download the "4k Peripheral blood mononuclear cells (PBMCs) from a Healthy Donor" data from ifx:/data/pub/bionano2018/scRNAseqWS.zip and unzip.
+
+###### Data specific information:
+
+The origin of the data is (http://cf.10xgenomics.com/samples/cell-exp/2.1.0/pbmc4k/pbmc4k_filtered_gene_bc_matrices.tar.gz)
+4k PBMCs from a Healthy Donor*.
+Single Cell Gene Expression Dataset by Cell Ranger 2.1.0 with GRCh38
+
+4,340 cells detected
+Sequenced on Illumina Hiseq4000 with approximately 87,000 reads per cell
+26bp read1 (16bp Chromium barcode and 10bp UMI), 98bp read2 (transcript), and 8bp I7 sample barcode
+Analysis run with --expect-cells=5000
+Published on November 8, 2017
+
+*This dataset is licensed under the Creative Commons Attribution license.
+
+
+##### Loading data and initial quality checks
+
+Seurat package provides a function for reading 10X datasets from a directory. This directory contains a matrix file (matrix.mtx) which stores UMI counts of genes for every cell in a sparse matrix format, a barcodes (barcodes.tsv) file which keeps the actual barcode sequences assigned to each cell, and a gene file (genes.tsv) for gene id/symbols from the transcriptome annotation. 
+
+```{r}
+library(Matrix)
+library(Seurat)
+library(dplyr)
+library(SIMLR)
+```
+
+Read10X function reads the input files and stores them in a matrix with all information merged together. 
+
+```{r}
+
+pbmc.data <- Read10X(data.dir = "~/Downloads/scRNAseqWS/10Xdata/filtered_gene_bc_matrices/GRCh38/")
+
+```
+We, then, create a Seurat object file using the data matrix we just generated. The raw data is stored in the 'raw.data' slot of the Seurat object (pbmc@raw.data). 
+
+Filter cells and/or genes:
+min.cells = 3   : keep all genes expressed in >= 3 cells. 
+min.genes = 200 : Keep all cells with at least 200 detected genes.
+
+```{r}
+
+pbmc <- CreateSeuratObject(raw.data = pbmc.data, min.cells = 3, min.genes = 200, project = "10X_PBMC")
+
+```
+
+One important measure is the proportion of mitochondrial gene expression to overall expression because this gives us an idea about the sensitivity level of sampling other transcripts. This code below will calculate it for each cell and add them to the Seurat object metadata.
+
+```{r}
+
+mito.genes <- grep(pattern = "^MT-", x = rownames(x = pbmc@data), value = TRUE)
+
+percent.mito <- Matrix::colSums(pbmc@raw.data[mito.genes, ])/Matrix::colSums(pbmc@raw.data)
+
+pbmc <- AddMetaData(object = pbmc, 
+                    metadata = percent.mito, 
+                    col.name = "percent.mito")
+
+head(pbmc@meta.data)
+
+```
+
+We can then check mitochondrial gene expression rate per cell as well as other two metrics internally calculated, nUMIs (Total UMI counts/cell) and nGene (number of genes detected).
+
+```{r}
+
+VlnPlot(pbmc, features.plot = c("nGene", "nUMI", "percent.mito"))
+
+```
+
+Using a function from the package, GenePlot, it is possible to compare cells for their nUMI, nGene, and mito percent values. 
+
+Since there is a rare subset of cells with an outlier level of high mitochondrial percentage and also low UMI content, these can be used for filtration as well.
+
+```{r}
+
+ggplot(pbmc@meta.data, aes(nUMI, nGene)) + geom_point()
+
+ggplot(pbmc@meta.data, aes(nUMI, percent.mito)) + geom_point()
+
+```
+
+
+```{r}
+
+pbmc <- FilterCells(pbmc, 
+                    subset.names = c("nGene", "percent.mito"), 
+                    low.thresholds = c(200, -Inf), 
+                    high.thresholds = c(2500, 0.05))
+
+#Check to see if filtration works as we expected.
+VlnPlot(pbmc, features.plot = c("nGene", "nUMI", "percent.mito"))
+
+```
+
+##### Normalization, Finding Variable Genes, and Scaling the data
+
+The default normalization method provided is "Log normalization" which normalizes gene expression by cell total expression and multiplies by a scale factor (10,000) then log-transforms the value. The normalized values are then stored in the 'data' slot of the Seurat object (pbmc@data). 
+
+```{r}
+
+pbmc <- NormalizeData(pbmc, 
+                      normalization.method = "LogNormalize", 
+                      scale.factor = 10000)
+```
+
+Here, 'FindVariableGenes' function calculates variance and mean for every genes across all cells and sorts genes by their variance to mean ratios (VMR). We are going to select top 1000 genes as highly variable genes.
+
+```{r}
+
+pbmc <- FindVariableGenes(pbmc, 
+                          mean.function = ExpMean, 
+                          dispersion.function = LogVMR, 
+                          do.plot = FALSE,
+                          display.progress = FALSE)
+
+hv.genes <- head(rownames(pbmc@hvg.info), 1000)
+
+```
+
+Scaling function, ScaleData, is used to scale and center the expression values of each gene. This function also gives us an opportunity to regress out any unwanted variation from known sources (linear regression). Keep in mind that since the downstream analysis such as dimension reduction is done using only highly variable genes, we can scale the data using only 'hv.genes'. The scaled expression values are then store in the 'scale.data' slot of the object (pbmc@scale.data).
+
+```{r}
+
+pbmc <- ScaleData(pbmc, 
+                  genes.use = hv.genes, 
+                  vars.to.regress = c("nUMI", "percent.mito"),
+                  display.progress = FALSE)
+
+```
+
+
+##### Dimension Reduction and Finding cell subtypes (with tSNE)
+
+Here, we are performing a Principal Component Analysis (PCA) on the normalized and scaled expression data using highly variable genes.
+
+```{r}
+
+pbmc <- RunPCA(pbmc, 
+               pc.genes = hv.genes, 
+               do.print = FALSE)
+
+```
+
+The first plot shows the first and second principal components. 
+
+```{r}
+
+PCAPlot(pbmc, dim.1 = 1, dim.2 = 2)
+
+```
+
+This second plot demonstrates the standard deviation explained by each PC. We are going to include PCs up to where the graph makes a kink.
+
+```{r}
+
+PCElbowPlot(pbmc)
+
+```
+
+Cluster cells is done using Shared Nearest Neighbor (SNN) method. First find k-nearest neighbors for every cell, then, construct a SNN graph. For more information about the algorithms, read Waltman and van Eck (2013) The European Physical Journal B. 
+Each cell (labelled with their barcode sequences) are assing to a cluster id:
+
+```{r}
+
+pbmc <- FindClusters(pbmc, 
+                     reduction.type = "pca", 
+                     dims.use = 1:10, 
+                     resolution = 0.6, 
+                     print.output = TRUE, 
+                     save.SNN = TRUE)
+
+head(pbmc@ident,20)
+
+```
+
+For visualizing clustered cells, we are going to use tSNE plot. When running tSNE we should be using the same PCs as we used previously in order to get the same clusters. 
+
+```{r}
+
+pbmc <- RunTSNE(pbmc, dims.use = 1:10, do.fast = TRUE)
+
+TSNEPlot(pbmc, do.label = TRUE)
+
+```
+
+
+##### Detecting marker genes of cell clusters
+
+Finally, here, we are going to determine differentially expressed genes unique to each cluster. The 'FindAllMarkers' function takes the expression of each gene in one cluster and compares against to all other clusters. By default, statistical test used is 'Wilcoxon rank sum test'; however, there are multiple other options including DESeq2. 
+Here, we are further constrains such as 'min.pct = 0.25' meaning that it will test only genes expressed in at least 25% of the cells in the cluster, etc.
+
+
+```{r}
+
+pbmc.markers <- FindAllMarkers(pbmc, 
+                               only.pos = TRUE, 
+                               min.pct = 0.25, 
+                               logfc.threshold = 0.25)
+
+top5.markers <- pbmc.markers %>% group_by(cluster) %>% top_n(5, avg_logFC)
+
+best.markers <- pbmc.markers %>% group_by(cluster) %>% top_n(1, avg_logFC)
+
+FeaturePlot(object = pbmc, 
+            features.plot = best.markers$gene, 
+            cols.use = c("grey", "blue"), 
+            reduction.use = "tsne")
+
+```
+
+
+## Part 2
+
+
+##### Second Part: Working with multiple scRNAseq datasets
+
+Alignment workflow for the four mouse brain datasets
+
+Zeisel et al: Single-cell RNA-seq of mouse cerebral cortex
+Tasic et al: Adult mouse cortical cell taxonomy by single cell transcriptomics
+Romanov et al: Single-cell RNA-seq of mouse hypothalamus
+Marques et al: RNA-seq analysis of single cells of the oligodendrocyte lineage from nine distinct regions of the anterior-posterior and dorsal-ventral axis of the mouse juvenile central nervous system
+
+The raw requencing reads were downloaded public SRA database and processed using Kallisto quantification pipeline. 
+
+##### Loading datasets and QC (with PCA)
+
+We start by loading the expression data and the metadata of each study.
+
+
+```{r}
+
+ob.list <- list("zeisel", "romanov", "tasic", "marques")
+
+#Load the expression and meta data of each study.
+
+for (i in 1:length(ob.list)){
+  obj.data <- paste(ob.list[[i]],".data",sep=""); 
+  #Read the expression matrix from a text file for each dataset.
+  assign(obj.data, read.delim(paste("~/Downloads/scRNAseqWS/",ob.list[[i]],".expression.txt",sep=""), header = TRUE, row.names = 1))
+  }
+
+#Since the expression matrices of these datasets are in TPM (already normalized), we are going to skip NormalizeData step in the following steps. However, we still need to log-transform it. log1p = log(1+x), natural log.
+zeisel.data <- log1p(zeisel.data)
+romanov.data <- log1p(romanov.data)
+tasic.data <- log1p(tasic.data)
+marques.data <- log1p(marques.data)
+
+for (i in 1:length(ob.list)){
+  obj.meta <- paste(ob.list[[i]],".meta",sep=""); 
+  #Reading the Run information meta data from a text file for each dataset.
+  assign(obj.meta, read.delim(paste("~/Downloads/scRNAseqWS/",ob.list[[i]],".RunTable.txt",sep=""), header = TRUE))
+}
+
+```
+
+Check the PCA and tSNE prior to alignment:
+```{r}
+
+rownames(zeisel.meta) <- zeisel.meta$Run_s
+rownames(romanov.meta) <- romanov.meta$Run_s
+rownames(tasic.meta) <- tasic.meta$Run_s
+rownames(marques.meta) <- marques.meta$Run_s
+
+batches <- rbind(zeisel.meta[,c("Run_s","Owner","SRA_Study_s")],
+                 tasic.meta[,c("Run_s","Owner","SRA_Study_s")],
+                 romanov.meta[,c("Run_s","Owner","SRA_Study_s")],
+                 marques.meta[,c("Run_s","Owner","SRA_Study_s")])
+
+combined.data <- cbind(zeisel.data, tasic.data, romanov.data, marques.data)
+
+combined.data <- as(as.matrix(combined.data), "dgCMatrix")
+
+fourDataset <- CreateSeuratObject(raw.data = combined.data, 
+                                  project = "4dataset.Pre")
+
+fourDataset <- AddMetaData(fourDataset, metadata = batches)
+
+fourDataset <- FilterCells(fourDataset, 
+                           subset.names = "nGene", 
+                           low.thresholds = 2500)
+
+fourDataset <- FindVariableGenes(fourDataset, 
+                                 do.plot = F, 
+                                 display.progress = F)
+
+fourDataset <- ScaleData(fourDataset, display.progress = F)
+
+fourDataset <- RunPCA(fourDataset, 
+                      pc.genes = fourDataset@var.genes, 
+                      pcs.compute = 5, 
+                      do.print = FALSE)
+
+PCAPlot(fourDataset, pt.size=1, group.by ="Owner", dim.1 = 1, dim.2 = 2)
+
+fourDataset <- RunTSNE(fourDataset, 
+                       reduction.use = "pca", 
+                       dims.use = 1:5)
+
+TSNEPlot(fourDataset, do.label = T, group.by ="Owner")
+
+```
+
+
+
+```{r warning=FALSE}
+
+#Subset the data
+zeisel <- SubsetData(fourDataset, 
+                     cells.use=names(zeisel.data), do.center=T, do.scale=T)
+
+tasic <- SubsetData(fourDataset, 
+                    cells.use=names(tasic.data), do.center=T, do.scale=T)
+
+romanov <- SubsetData(fourDataset, 
+                      cells.use=names(romanov.data), do.center=T, do.scale=T)
+
+marques <- SubsetData(fourDataset, 
+                      cells.use=names(marques.data), do.center=T, do.scale=T)
+
+```
+
+
+##### Outline of the alignment process
+
+1) Select highly variable genes shared by at least two datasets,
+2) Identify shared correlation structures (cannonical correlation vectors) across datasets,
+3) Align these dimensions using dynamic time wrapping,
+4) Use cells embedded into low-dimensional space for clustering.
+
+##### Finding common variable genes between multiple datasets
+
+Determine genes to use for CCA, must be highly variable in at least 2 datasets
+
+```{r}
+
+ob.list <- list(zeisel, romanov, tasic, marques)
+
+genes.use <- c()
+for (i in 1:length(ob.list)) {
+  genes.use <- c(genes.use, head(rownames(ob.list[[i]]@hvg.info), 1000))
+}
+genes.use <- names(which(table(genes.use) > 1))
+for (i in 1:length(ob.list)) {
+  genes.use <- genes.use[genes.use %in% rownames(ob.list[[i]]@scale.data)]
+}
+
+```
+
+##### Multi-dataset alignment with CCA
+
+Run multi-set CCA
+
+```{r}
+
+mouseBrain.integrated <- RunMultiCCA(ob.list, genes.use = genes.use, num.ccs = 15)
+
+```
+
+
+Run rare non-overlapping filtering
+
+```{r}
+
+mouseBrain.integrated <- CalcVarExpRatio(mouseBrain.integrated,
+                                         reduction.type = "pca",
+                                         grouping.var = "Owner", 
+                                         dims.use = 1:10)
+
+mouseBrain.integrated <- SubsetData(mouseBrain.integrated, 
+                                    subset.name = "var.ratio.pca",
+                                    accept.low = 0.5)
+
+```
+
+Alignment:
+
+```{r message=FALSE, warning=FALSE}
+
+mouseBrain.integrated <- AlignSubspace(mouseBrain.integrated,
+                                       reduction.type = "cca",
+                                       grouping.var = "Owner",
+                                       dims.align = 1:10)
+```
+
+##### Post-Alignment cell clustering
+
+t-SNE and Clustering
+
+```{r}
+
+mouseBrain.integrated <- FindClusters(mouseBrain.integrated,
+                                      reduction.type = "cca.aligned",
+                                      dims.use = 1:10, save.SNN = T,
+                                      resolution = 0.4)
+
+mouseBrain.integrated <- RunTSNE(mouseBrain.integrated,
+                                 reduction.use = "cca.aligned",
+                                 dims.use = 1:10,
+                                 check_duplicates = FALSE)
+# Visualization
+TSNEPlot(mouseBrain.integrated, do.label = T)
+
+TSNEPlot(mouseBrain.integrated, do.label = T, group.by ="Owner")
+
+```
+
+##### Exploring the alternative Clustering options with SIMLR
+
+```{r}
+
+library(SIMLR)
+
+set.seed(11111)
+#zeisel.data is already in log.
+# Determine optimal number of clusters as described in the Nat. Methods paper
+# picka cluster range and reports two metrics; the lower the value the more
+# support for that number of clusters; in my limited experience these methods
+# are concordant.
+
+zclust<-SIMLR_Estimate_Number_of_Clusters(zeisel.data, NUMC=2:5)
+
+#run SIMLR
+zsimlr<-SIMLR(zeisel.data, 4)
+
+# Create plotting function, color-coding points by cluster membership
+plotSIMLRclusters <- function(obj) {                                                                                                                                                           
+    col <- ifelse(obj$y$cluster==1, 'red', ifelse(obj$y$cluster==2, 'blue',
+                                                     ifelse(obj$y$cluster==3, 'green','yellow')))    
+    plot(obj$ydata, col=col, xlab = "SIMLR component 1", ylab = "SIMLR component 2", pch=20,  cex=0.7) 
+}
+
+# Call plotting function
+plotSIMLRclusters(zsimlr)
+
+```
+
+```{r}
+sessionInfo()
+```
